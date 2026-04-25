@@ -58,8 +58,13 @@ type Node struct {
 	mu          sync.RWMutex
 	commitments []*commitment.Commitment
 	running     bool
+	ctx         context.Context // lifecycle ctx; set on Start
 	cancel      context.CancelFunc
-	wg          sync.WaitGroup
+	wg          sync.WaitGroup // tracks the three handler goroutines
+
+	// callbackWG tracks in-flight onCommitment callback goroutines so
+	// Stop can wait for them to drain before tearing down resources.
+	callbackWG sync.WaitGroup
 
 	// Callbacks
 	onCommitment func(*commitment.Commitment)
@@ -157,6 +162,7 @@ func (n *Node) Start(ctx context.Context) error {
 	}
 
 	ctx, cancel := context.WithCancel(ctx)
+	n.ctx = ctx
 	n.cancel = cancel
 	n.running = true
 	n.mu.Unlock()
@@ -184,7 +190,9 @@ func (n *Node) Start(ctx context.Context) error {
 	return nil
 }
 
-// Stop stops the node
+// Stop stops the node and tears down pubsub state. It blocks until
+// handler goroutines and any in-flight onCommitment callbacks have
+// finished, then leaves the pubsub topics and closes the host.
 func (n *Node) Stop() error {
 	n.mu.Lock()
 	if !n.running {
@@ -195,9 +203,40 @@ func (n *Node) Stop() error {
 	n.running = false
 	n.mu.Unlock()
 
+	// Cancel subscriptions so subSub.Next/commitSub.Next return
+	// (ctx cancellation alone is enough to make Next return, but
+	// Cancel also releases the subscription's internal state).
+	n.subSub.Cancel()
+	n.commitSub.Cancel()
+
+	// Wait for handler goroutines to exit before leaving topics —
+	// otherwise a handler could still be touching topic state.
 	n.wg.Wait()
+
+	// Wait for any in-flight commitment callbacks to drain so the
+	// caller's Stop() can safely tear down state the callbacks reference.
+	n.callbackWG.Wait()
+
+	// Leave the pubsub topics. Errors here are non-fatal — host.Close
+	// will clean up anything that's left.
+	var topicErrs []error
+	if err := n.subTopic.Close(); err != nil {
+		topicErrs = append(topicErrs, fmt.Errorf("close submissions topic: %w", err))
+	}
+	if err := n.commitTopic.Close(); err != nil {
+		topicErrs = append(topicErrs, fmt.Errorf("close commitments topic: %w", err))
+	}
+
 	n.mempool.Close()
-	return n.host.Close()
+
+	if err := n.host.Close(); err != nil {
+		topicErrs = append(topicErrs, fmt.Errorf("close host: %w", err))
+	}
+
+	if len(topicErrs) > 0 {
+		return fmt.Errorf("errors during shutdown: %v", topicErrs)
+	}
+	return nil
 }
 
 // Connect connects to a peer by multiaddr string
@@ -233,11 +272,28 @@ func (n *Node) Difficulty() uint8 {
 	return n.mempool.Difficulty()
 }
 
-// SetOnCommitment sets a callback for new commitments
+// SetOnCommitment sets a callback for new commitments. The callback is
+// invoked in a separate goroutine for each commitment; panics inside
+// the callback are recovered and logged so they cannot crash the node.
 func (n *Node) SetOnCommitment(fn func(*commitment.Commitment)) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.onCommitment = fn
+}
+
+// runCallback dispatches an onCommitment callback in a tracked goroutine
+// with panic recovery. Stop() waits on callbackWG before tearing down state.
+func (n *Node) runCallback(callback func(*commitment.Commitment), c *commitment.Commitment) {
+	n.callbackWG.Add(1)
+	go func() {
+		defer n.callbackWG.Done()
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("commitment callback panicked: %v", r)
+			}
+		}()
+		callback(c)
+	}()
 }
 
 // Commitments returns all stored commitments
@@ -259,8 +315,22 @@ func (n *Node) Mempool() *mempool.Mempool {
 	return n.mempool
 }
 
-// gossipSubmission broadcasts a submission to peers
+// publishTimeout bounds a single Publish call so a hung pubsub mesh
+// can't pin a goroutine indefinitely.
+const publishTimeout = 5 * time.Second
+
+// gossipSubmission broadcasts a submission to peers. It uses the node's
+// lifecycle ctx (set by Start) so a Publish in flight aborts when Stop is
+// called. If invoked before Start, the call is skipped — there are no
+// peers to gossip to yet.
 func (n *Node) gossipSubmission(sub *mempool.Submission) {
+	n.mu.RLock()
+	parent := n.ctx
+	n.mu.RUnlock()
+	if parent == nil {
+		return
+	}
+
 	msg := SubmissionMessage{
 		Hash:  sub.Hash,
 		Nonce: sub.Nonce,
@@ -272,7 +342,10 @@ func (n *Node) gossipSubmission(sub *mempool.Submission) {
 		return
 	}
 
-	if err := n.subTopic.Publish(context.Background(), data); err != nil {
+	ctx, cancel := context.WithTimeout(parent, publishTimeout)
+	defer cancel()
+
+	if err := n.subTopic.Publish(ctx, data); err != nil {
 		log.Printf("Failed to publish submission: %v", err)
 	}
 }
@@ -352,7 +425,7 @@ func (n *Node) handleCommitments(ctx context.Context) {
 		n.mu.Unlock()
 
 		if callback != nil {
-			go callback(&c)
+			n.runCallback(callback, &c)
 		}
 
 		if n.cfg.Verbose {
@@ -419,7 +492,7 @@ func (n *Node) createCommitment(ctx context.Context, round uint64, timestamp tim
 	n.mu.Unlock()
 
 	if callback != nil {
-		go callback(c)
+		n.runCallback(callback, c)
 	}
 
 	// Broadcast
